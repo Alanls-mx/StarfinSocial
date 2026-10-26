@@ -1,0 +1,4 @@
+name: StarfinSocial
+main: com.starfinplugins.social.bungee.StarfinSocialBungee
+version: 0.1.0
+author: StarfinPlugins

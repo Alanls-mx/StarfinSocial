@@ -1,0 +1,40 @@
+proxy-id: proxy-1
+locale: pt_BR
+mysql:
+  host: localhost
+  port: 3306
+  database: starfin
+  username: starfin
+  password: CHANGE_ME
+  ssl-mode: PREFERRED
+party:
+  enabled: true
+  default-max-members: 16
+  absolute-max-members: 32
+  invite-expiration-seconds: 60
+  invite-cooldown-seconds: 3
+  leader-disconnect:
+    grace-period-seconds: 120
+    transfer-on-timeout: true
+  privacy:
+    default: INVITE_ONLY
+  chat:
+    enabled: true
+    cooldown-seconds: 1
+  network:
+    cross-server: true
+    presence-timeout-seconds: 30
+  aliases:
+    p: true
+    pc: true
+  permissions:
+    default-actions:
+      - use
+      - create
+      - invite
+      - kick
+      - promote
+      - transfer
+      - disband
+      - chat
+      - settings

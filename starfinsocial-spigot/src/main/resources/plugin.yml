@@ -1,0 +1,5 @@
+name: StarfinSocial
+version: 0.1.0
+main: com.starfinplugins.social.spigot.StarfinSocialSpigot
+author: StarfinPlugins
+description: Read-only Party API for Spigot servers
