@@ -16,6 +16,7 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Map;
 import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
@@ -81,7 +82,14 @@ public final class SocialStore {
                 + "delivered_at BIGINT NULL,INDEX idx_ss_delivery (recipient_uuid,delivered_at,id),"
                 + "INDEX idx_ss_notification_expiry (expires_at))"
                 + " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+            s.execute("CREATE TABLE IF NOT EXISTS ss_chat_log ("
+                + "id BIGINT AUTO_INCREMENT PRIMARY KEY,party_id CHAR(36) NOT NULL,"
+                + "sender_uuid CHAR(36) NOT NULL,body VARCHAR(160) NOT NULL,"
+                + "sent_at BIGINT NOT NULL,INDEX idx_ss_chat_party (party_id,id))"
+                + " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
             s.execute("INSERT IGNORE INTO ss_schema_migrations(version,applied_at) VALUES(1,"
+                + System.currentTimeMillis() + ")");
+            s.execute("INSERT IGNORE INTO ss_schema_migrations(version,applied_at) VALUES(2,"
                 + System.currentTimeMillis() + ")");
         }
     }
@@ -174,6 +182,59 @@ public final class SocialStore {
                     if (claim.executeUpdate() == 1)
                         claimed.add(new Notification(id, recipient, rows.getString(2),
                             rows.getString(3), rows.getString(4), rows.getString(5)));
+                }
+            }
+        }
+        return claimed;
+    }
+
+    /** One indexed poll per group of local recipients, with session ownership rechecked in MySQL. */
+    public List<Notification> claimNotifications(Map<UUID, UUID> recipients, int limit)
+            throws SQLException {
+        if (recipients == null || limit < 1 || limit > 500)
+            throw new IllegalArgumentException("Lote de notificações inválido");
+        List<Notification> claimed = new ArrayList<Notification>();
+        if (recipients.isEmpty()) return claimed;
+        List<UUID> players = new ArrayList<UUID>(recipients.keySet());
+        long now = clock.getAsLong();
+        try (Connection c = dataSource.getConnection()) {
+            for (int offset = 0; offset < players.size() && claimed.size() < limit; offset += 200) {
+                int end = Math.min(players.size(), offset + 200);
+                StringBuilder sql = new StringBuilder("SELECT n.id,n.recipient_uuid,n.party_id,"
+                    + "n.kind,n.actor_uuid,n.body,p.session_id FROM ss_notifications n"
+                    + " JOIN ss_presence p ON p.player_uuid=n.recipient_uuid"
+                    + " WHERE n.recipient_uuid IN (");
+                for (int i = offset; i < end; i++) {
+                    if (i > offset) sql.append(',');
+                    sql.append('?');
+                }
+                sql.append(") AND n.delivered_at IS NULL AND n.expires_at>?"
+                    + " AND n.claim_until<? AND p.connected=1 AND p.last_seen>=?"
+                    + " ORDER BY n.id LIMIT ?");
+                Object[] values = new Object[end - offset + 4];
+                for (int i = offset; i < end; i++) values[i - offset] = players.get(i);
+                values[end - offset] = now;
+                values[end - offset + 1] = now;
+                values[end - offset + 2] = now - rules.presenceTimeoutMs;
+                values[end - offset + 3] = limit - claimed.size();
+                try (PreparedStatement list = prepare(c, sql.toString(), values);
+                     ResultSet rows = list.executeQuery()) {
+                    while (rows.next()) {
+                        long id = rows.getLong(1);
+                        UUID recipient = UUID.fromString(rows.getString(2));
+                        UUID session = recipients.get(recipient);
+                        if (session == null || !session.toString().equals(rows.getString(7))) continue;
+                        try (PreparedStatement claim = prepare(c,
+                                "UPDATE ss_notifications SET claimed_session=?,claim_until=?"
+                                + " WHERE id=? AND recipient_uuid=? AND delivered_at IS NULL"
+                                + " AND claim_until<? AND EXISTS (SELECT 1 FROM ss_presence"
+                                + " WHERE player_uuid=? AND session_id=? AND connected=1)",
+                                session, now + 10000, id, recipient, now, recipient, session)) {
+                            if (claim.executeUpdate() == 1)
+                                claimed.add(new Notification(id, recipient, rows.getString(3),
+                                    rows.getString(4), rows.getString(5), rows.getString(6)));
+                        }
+                    }
                 }
             }
         }
@@ -821,6 +882,30 @@ public final class SocialStore {
                     id, "CHAT", sender, body);
             }
             return PartyResult.ok(null);
+        });
+    }
+
+    /** Called after proxy-local delivery. Logging and cross-proxy fanout never delay local chat. */
+    public void recordDeliveredChat(UUID party, UUID sender, String body, String localProxy)
+            throws SQLException {
+        if (party == null || sender == null || localProxy == null
+                || body == null || body.isEmpty() || body.length() > 160)
+            throw new IllegalArgumentException("Chat invalido");
+        tx(c -> {
+            long now = clock.getAsLong();
+            try (PreparedStatement log = prepare(c,
+                    "INSERT INTO ss_chat_log(party_id,sender_uuid,body,sent_at) VALUES(?,?,?,?)",
+                    party, sender, body, now)) { log.executeUpdate(); }
+            try (PreparedStatement q = prepare(c,
+                    "SELECT m.player_uuid FROM ss_members m JOIN ss_presence p"
+                    + " ON p.player_uuid=m.player_uuid WHERE m.party_id=? AND p.connected=1"
+                    + " AND p.proxy_id<>? AND p.last_seen>=? ORDER BY m.joined_at,m.player_uuid",
+                    party, localProxy, now - rules.presenceTimeoutMs);
+                 ResultSet recipients = q.executeQuery()) {
+                while (recipients.next()) emit(c, UUID.fromString(recipients.getString(1)),
+                    party, "CHAT", sender, body);
+            }
+            return null;
         });
     }
 

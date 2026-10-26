@@ -13,7 +13,7 @@ Plugin independente de Party para rede BungeeCord com servidores Spigot 1.8.8. C
 
 O MySQL é a autoridade compartilhada. Cada alteração relevante da Party bloqueia sua linha (`SELECT ... FOR UPDATE`) e confirma membro, liderança, convite e notificação na mesma transação. `ss_members.player_uuid` impede filiação simultânea a duas Parties. O proxy usa UUIDs obtidos de `ProxiedPlayer`, nunca nomes como chave persistente. Nomes informados em comandos são resolvidos no banco e recusados se forem ambíguos.
 
-As instâncias de BungeeCord gravam presença com um ID novo para cada sessão e atualizam essa presença a cada dois segundos. Desconexões marcam a sessão como encerrada; troca de servidor apenas muda `server_name`. Um proxy que cai deixa a presença expirar. Notificações são gravadas na tabela `ss_notifications`, reclamadas por sessão com prazo e marcadas como entregues antes de serem enviadas ao cliente. Assim não dependem de mensagens Spigot que exigem jogador conectado. O chat mantém a ordem dos IDs de notificação por destinatário; uma queda entre marcar entregue e enviar pode perder a mensagem. Esta é a escolha para evitar duplicatas após uma falha. Não há entrega garantida exatamente uma vez sob falha de processo/rede.
+As instâncias de BungeeCord gravam presença com um ID novo para cada sessão e renovam o heartbeat a cada dez segundos. Desconexões marcam a sessão como encerrada; troca de servidor apenas muda `server_name`. Um proxy que cai deixa a presença expirar. Convites e mudanças são gravados em `ss_notifications` e buscados em lote para jogadores locais a cada 250 ms, com confirmação da sessão no MySQL. A mensagem de chat da Party é enviada diretamente pelo proxy aos membros locais autenticados, inclusive quando estão em servidores Spigot diferentes. Só depois da entrega local uma tarefa assíncrona registra o chat em `ss_chat_log` e cria notificações de chat para membros em outro proxy. Assim, o chat local não aguarda o banco. O repasse entre proxies ainda depende do MySQL e do polling; uma falha no processo ou banco pode perder o registro ou essa entrega remota.
 
 ## Instalação
 
@@ -21,7 +21,7 @@ As instâncias de BungeeCord gravam presença com um ID novo para cada sessão e
 2. Copie `starfinsocial-bungee/target/StarfinSocial-Bungee.jar` para `plugins/` de **cada** proxy.
 3. Copie `starfinsocial-spigot/target/StarfinSocial-Spigot.jar` para `plugins/` dos servidores Spigot que precisam da API local de leitura. O módulo Spigot é opcional para o funcionamento dos comandos no proxy.
 4. Edite `plugins/StarfinSocial/config.yml` em cada instância com o mesmo banco MySQL, usuário e senha. Use um `proxy-id` distinto em cada proxy. Credenciais não estão no código.
-5. Reinicie proxy e Spigot. O proxy cria apenas as tabelas `ss_` na migração v1. O Spigot não executa migrações nem altera Parties.
+5. Reinicie proxy e Spigot. O proxy aplica as migrações `ss_` v1 e v2. O Spigot não executa migrações nem altera Parties.
 
 O proxy e cada servidor Spigot têm configurações próprias. `mysql.ssl-mode` admite `DISABLED`, `PREFERRED`, `REQUIRED`, `VERIFY_CA` ou `VERIFY_IDENTITY`. Para um ambiente externo, configure TLS conforme o banco. A JAR contém o driver MySQL e Hikari isolados por relocation; não requer StarfinCore no proxy nem no Spigot.
 
@@ -61,7 +61,7 @@ Convites expiram após 60 segundos por padrão. O mesmo remetente tem intervalo 
 
 O líder que se desconecta mantém sua posição por 120 segundos por padrão. Se voltar dentro do prazo, continua líder. Após o prazo, a Party passa para um oficial conectado; se não houver, para o membro conectado mais antigo. Se ninguém estiver elegível, a Party expira e libera os membros. A eleição é serializada pelo bloqueio da linha da Party. A varredura acontece aproximadamente a cada dez segundos.
 
-## Tabelas MySQL v1
+## Tabelas MySQL
 
 | Tabela | Função |
 | --- | --- |
@@ -71,9 +71,10 @@ O líder que se desconecta mantém sua posição por 120 segundos por padrão. S
 | `ss_invites` | Convites e seus cinco estados; índice único em convite pendente por Party/alvo. |
 | `ss_presence` | Nome recente, proxy, sessão, servidor e heartbeat. |
 | `ss_cooldowns` | Limites de frequência. |
-| `ss_notifications` | Caixa de saída compartilhada para chat, convites e mudanças. |
+| `ss_notifications` | Caixa de saída para convites, mudanças e chat destinado a outro proxy. |
+| `ss_chat_log` | Registro das mensagens após a entrega local (migração v2). |
 
-Não há tabelas de amizades ou clãs nesta fase. As migrações são idempotentes; a versão 1 cria apenas as tabelas acima. Uma evolução futura deve adicionar uma versão nova e preservar os dados existentes.
+Não há tabelas de amizades ou clãs nesta fase. As migrações são idempotentes e preservam os dados existentes.
 
 ## API pública
 
@@ -81,7 +82,7 @@ No BungeeCord, obtenha o plugin `StarfinSocial` e use `((StarfinSocialBungee) pl
 
 No Spigot, consulte `Bukkit.getServicesManager().getRegistration(PartyDirectory.class)`. `PartyDirectory` retorna `CompletableFuture<PartySnapshot>` para leituras de membros, cargo, servidor e estado. Nunca bloqueie a thread principal esperando o resultado nem tente modificar a coleção imutável do snapshot. A API Spigot não oferece mutações; o proxy decide o estado da rede.
 
-`PartyService.subscribe` registra `PartyEventListener`. Eventos `CREATE`, `DISBAND`, `INVITE`, `JOIN`, `LEAVE`, `KICK`, `PROMOTE`, `LEADER_CHANGE`, `SETTINGS_CHANGE` e `CHAT` são publicados **após commit** para operações originadas naquele proxy. Para sincronização distribuída, consulte o banco por API; não use eventos locais como fonte de verdade em múltiplos proxies. Eventos canceláveis antes do commit não foram oferecidos porque veto assíncrono em várias instâncias não preservaria a transação.
+`PartyService.subscribe` registra `PartyEventListener`. Eventos de alteração de Party são publicados após commit. O evento `CHAT` é publicado após a entrega local e antes do registro assíncrono no banco. Para sincronização distribuída, consulte o banco por API; não use eventos locais como fonte de verdade em múltiplos proxies.
 
 As mutações da API verificam a sessão autenticada, a ação permitida e o limite de membros da mesma forma que os comandos. Plugins consumidores são compilados contra `starfinsocial-api` com escopo `provided`; não empacote outra cópia das classes da API. No Spigot, declare `softdepend: [StarfinSocial]` se for usar o serviço opcional.
 

@@ -2,6 +2,8 @@ package com.starfinplugins.social.bungee;
 
 import com.starfinplugins.social.api.*;
 import com.starfinplugins.social.common.SocialStore;
+import com.starfinplugins.social.common.PartyChatState;
+import com.starfinplugins.social.common.PartyRules;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import java.lang.reflect.Field;
@@ -48,9 +50,11 @@ public final class StarfinSocialBungee extends Plugin implements Listener {
     private final CopyOnWriteArrayList<PartyEventListener> listeners =
         new CopyOnWriteArrayList<PartyEventListener>();
     private final PartyService service = new Service();
+    private final PartyChatState chatState = new PartyChatState();
     private final AtomicBoolean maintaining = new AtomicBoolean();
     private volatile boolean stopping;
-    private volatile long lastSweepAt, lastCleanupAt;
+    private volatile long lastSweepAt, lastCleanupAt, lastHeartbeatAt, lastInitAttemptAt;
+    private volatile long lastDatabaseWarningAt;
 
     @Override public void onEnable() {
         try {
@@ -79,7 +83,7 @@ public final class StarfinSocialBungee extends Plugin implements Listener {
                     finally { maintaining.set(false); }
                 })) maintaining.set(false);
             },
-                2, 2, TimeUnit.SECONDS);
+                250, 250, TimeUnit.MILLISECONDS);
             getLogger().info("StarfinSocial-Bungee iniciado; banco será validado assincronamente.");
         } catch (Exception error) {
             getLogger().log(Level.SEVERE, "StarfinSocial-Bungee não iniciou", error);
@@ -90,8 +94,11 @@ public final class StarfinSocialBungee extends Plugin implements Listener {
         }
     }
 
-    private void initialize() {
+    private synchronized void initialize() {
         if (stopping || store != null) return;
+        long now = System.currentTimeMillis();
+        if (now - lastInitAttemptAt < 5000) return;
+        lastInitAttemptAt = now;
         try {
             if (pool == null) {
                 HikariConfig hikari = new HikariConfig();
@@ -111,10 +118,10 @@ public final class StarfinSocialBungee extends Plugin implements Listener {
             SocialStore next = new SocialStore(pool, config.rules);
             next.migrate();
             store = next;
-            getLogger().info("StarfinSocial MySQL pronto (ss_schema_migrations v1).");
+            getLogger().info("StarfinSocial MySQL pronto (ss_schema_migrations v2).");
             for (ProxiedPlayer player : getProxy().getPlayers()) startSession(player);
         } catch (Exception error) {
-            getLogger().warning("StarfinSocial MySQL indisponível; nova tentativa em breve ("
+            warnDatabase("StarfinSocial MySQL indisponível; nova tentativa em breve ("
                 + error.getClass().getSimpleName() + ").");
         }
     }
@@ -124,36 +131,56 @@ public final class StarfinSocialBungee extends Plugin implements Listener {
         SocialStore db = store;
         if (db == null) { initialize(); return; }
         try {
+            long now = System.currentTimeMillis();
+            boolean heartbeatDue = now - lastHeartbeatAt >= 10000;
+            Map<UUID, UUID> recipients = new java.util.HashMap<UUID, UUID>();
             for (ProxiedPlayer player : getProxy().getPlayers()) {
                 UUID session = sessions.get(player.getUniqueId());
                 if (session == null) { startSession(player); continue; }
-                boolean valid = db.heartbeat(player.getUniqueId(), session, server(player));
-                if (!valid) {
-                    sessions.remove(player.getUniqueId(), session);
-                    chatMode.remove(player.getUniqueId());
-                    continue;
-                }
-                if (!authenticated(player)) continue;
-                for (SocialStore.Notification notification :
-                        db.claimNotifications(player.getUniqueId(), session, 50)) {
-                    if (!session.equals(sessions.get(player.getUniqueId()))) break;
-                    if ("INVITE".equals(notification.kind)
-                            && (notification.partyId == null || notification.actorId == null
-                                || !db.inviteDeliverable(player.getUniqueId(),
-                                    UUID.fromString(notification.actorId),
-                                    UUID.fromString(notification.partyId)))) {
-                        db.markDelivered(notification.id, session);
+                if (heartbeatDue) {
+                    boolean valid = db.heartbeat(player.getUniqueId(), session, server(player));
+                    if (!valid) {
+                        sessions.remove(player.getUniqueId(), session);
+                        chatMode.remove(player.getUniqueId());
                         continue;
                     }
-                    if (db.markDelivered(notification.id, session)) deliver(player, notification);
+                    PartySnapshot current = db.getParty(player.getUniqueId());
+                    if (current == null) chatState.forget(player.getUniqueId());
+                    else chatState.apply(current);
                 }
+                if (authenticated(player)) recipients.put(player.getUniqueId(), session);
             }
-            long now = System.currentTimeMillis();
+            if (heartbeatDue) lastHeartbeatAt = now;
+            for (SocialStore.Notification notification : db.claimNotifications(recipients, 100)) {
+                UUID session = recipients.get(notification.recipient);
+                ProxiedPlayer player = getProxy().getPlayer(notification.recipient);
+                if (session == null || player == null
+                        || !session.equals(sessions.get(notification.recipient))) continue;
+                if (notification.partyId != null && !"CHAT".equals(notification.kind)
+                        && !"INVITE".equals(notification.kind))
+                    chatState.apply(db.getPartyById(UUID.fromString(notification.partyId)));
+                if ("INVITE".equals(notification.kind)
+                        && (notification.partyId == null || notification.actorId == null
+                            || !db.inviteDeliverable(player.getUniqueId(),
+                                UUID.fromString(notification.actorId),
+                                UUID.fromString(notification.partyId)))) {
+                    db.markDelivered(notification.id, session);
+                    continue;
+                }
+                if (db.markDelivered(notification.id, session)) deliver(player, notification);
+            }
             if (now - lastSweepAt >= 10000) { db.sweep(); lastSweepAt = now; }
             if (now - lastCleanupAt >= 60000) { db.cleanupNotifications(); lastCleanupAt = now; }
-        } catch (SQLException error) {
-            getLogger().warning("Falha transitória de Party/MySQL; operações serão rejeitadas até recuperar.");
+        } catch (SQLException | RuntimeException error) {
+            warnDatabase("Falha transitória de Party/MySQL; operações serão rejeitadas até recuperar.");
         }
+    }
+
+    private synchronized void warnDatabase(String message) {
+        long now = System.currentTimeMillis();
+        if (now - lastDatabaseWarningAt < 30000) return;
+        lastDatabaseWarningAt = now;
+        getLogger().warning(message);
     }
 
     private void deliver(ProxiedPlayer player, SocialStore.Notification n) throws SQLException {
@@ -207,6 +234,7 @@ public final class StarfinSocialBungee extends Plugin implements Listener {
         ProxiedPlayer player = event.getPlayer();
         UUID session = sessions.remove(player.getUniqueId());
         chatMode.remove(player.getUniqueId());
+        chatState.clearCooldown(player.getUniqueId());
         if (session != null) runIo(() -> {
             try { if (store != null) store.sessionEnded(player.getUniqueId(), session); }
             catch (SQLException ignored) { /* presence timeout handles crash */ }
@@ -239,6 +267,9 @@ public final class StarfinSocialBungee extends Plugin implements Listener {
             db.sessionStarted(player.getUniqueId(), player.getName(), config.proxyId,
                 session, server(player));
             sessions.put(player.getUniqueId(), session);
+            PartySnapshot current = db.getParty(player.getUniqueId());
+            if (current == null) chatState.forget(player.getUniqueId());
+            else chatState.apply(current);
         } catch (SQLException error) {
             getLogger().warning("Sessão social indisponível; tentativa automática.");
         }
@@ -320,6 +351,8 @@ public final class StarfinSocialBungee extends Plugin implements Listener {
             if (!permitted(player, "use") || !permitted(player, permission))
                 return PartyResult.fail(PartyResult.Code.NO_PERMISSION);
             PartyResult<T> result = operation.run(db);
+            if (result.succeeded() && result.value instanceof PartySnapshot)
+                chatState.apply((PartySnapshot) result.value);
             if (result.succeeded() && event != null) {
                 PartySnapshot party = result.value instanceof PartySnapshot
                     ? (PartySnapshot) result.value : db.getParty(actor);
@@ -338,11 +371,16 @@ public final class StarfinSocialBungee extends Plugin implements Listener {
     private final class Service implements PartyService {
         @Override public CompletableFuture<PartySnapshot> getParty(UUID player) {
             return async(() -> { if (store == null) throw new SQLException("Unavailable");
-                return store.getParty(player); });
+                PartySnapshot party = store.getParty(player);
+                if (party == null) chatState.forget(player);
+                else chatState.apply(party);
+                return party; });
         }
         @Override public CompletableFuture<PartySnapshot> getPartyById(UUID id) {
             return async(() -> { if (store == null) throw new SQLException("Unavailable");
-                return store.getPartyById(id); });
+                PartySnapshot party = store.getPartyById(id);
+                chatState.apply(party);
+                return party; });
         }
         @Override public CompletableFuture<PartyResult<PartySnapshot>> createParty(UUID a,int n) {
             ProxiedPlayer player = getProxy().getPlayer(a);
@@ -377,7 +415,47 @@ public final class StarfinSocialBungee extends Plugin implements Listener {
                 return CompletableFuture.completedFuture(PartyResult.fail(PartyResult.Code.NO_PERMISSION));
             return change(a, db -> db.setMaxMembers(a,n), PartyEvent.Type.SETTINGS_CHANGE); }
         @Override public CompletableFuture<PartyResult<Void>> sendChat(UUID a,String m) {
-            return change(a, db -> db.chat(a,m), PartyEvent.Type.CHAT); }
+            ProxiedPlayer sender = getProxy().getPlayer(a);
+            if (sender == null || sessions.get(a) == null || !authenticated(sender))
+                return CompletableFuture.completedFuture(PartyResult.fail(PartyResult.Code.UNAVAILABLE));
+            if (!permitted(sender, "use") || !permitted(sender, "chat"))
+                return CompletableFuture.completedFuture(PartyResult.fail(PartyResult.Code.NO_PERMISSION));
+            if (!config.rules.enabled || !config.rules.chatEnabled)
+                return CompletableFuture.completedFuture(PartyResult.fail(PartyResult.Code.DISABLED));
+            final String body;
+            try { body = PartyRules.chat(m); }
+            catch (IllegalArgumentException error) {
+                return CompletableFuture.completedFuture(PartyResult.fail(PartyResult.Code.INVALID));
+            }
+            PartySnapshot party = chatState.forPlayer(a);
+            if (party == null)
+                return CompletableFuture.completedFuture(PartyResult.fail(PartyResult.Code.NOT_IN_PARTY));
+            if (!party.chatEnabled)
+                return CompletableFuture.completedFuture(PartyResult.fail(PartyResult.Code.DISABLED));
+            if (!chatState.allowChat(a, System.nanoTime(), config.rules.chatCooldownMs))
+                return CompletableFuture.completedFuture(PartyResult.fail(PartyResult.Code.COOLDOWN));
+            TextComponent line = messages.line("chat-line", vars("player", sender.getName(),
+                "message", body));
+            for (PartyMember member : party.members) {
+                if (!chatState.memberOf(member.playerId, party.id)) continue;
+                ProxiedPlayer recipient = getProxy().getPlayer(member.playerId);
+                if (recipient != null && sessions.get(member.playerId) != null
+                        && authenticated(recipient)) recipient.sendMessage(line);
+            }
+            PartyEvent published = new PartyEvent(PartyEvent.Type.CHAT, party.id, a, null,
+                party.revision, System.currentTimeMillis());
+            for (PartyEventListener listener : listeners) try { listener.onPartyEvent(published); }
+            catch (RuntimeException error) { getLogger().warning("Listener de Party falhou."); }
+            if (!runIo(() -> {
+                SocialStore db = store;
+                if (db != null) try {
+                    db.recordDeliveredChat(party.id, a, body, config.proxyId);
+                } catch (SQLException error) {
+                    warnDatabase("Falha ao registrar/replicar mensagem da Party.");
+                }
+            })) warnDatabase("Fila SQL ocupada; chat local entregue sem registro.");
+            return CompletableFuture.completedFuture(PartyResult.ok(null));
+        }
         @Override public CompletableFuture<PartyResult<PartyTransferPlan>> planTransfer(UUID a,String d,int c) {
             return change(a, db -> db.planTransfer(a,d,c), null); }
         @Override public AutoCloseable subscribe(PartyEventListener listener) {

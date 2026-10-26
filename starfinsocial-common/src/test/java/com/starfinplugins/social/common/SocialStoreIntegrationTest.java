@@ -12,6 +12,8 @@ import java.sql.SQLFeatureNotSupportedException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.HashMap;
 import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
@@ -65,6 +67,7 @@ public final class SocialStoreIntegrationTest {
         store.migrate();
         try (Connection conn = source.getConnection(); Statement q = conn.createStatement()) {
             q.executeUpdate("DELETE FROM ss_notifications");
+            q.executeUpdate("DELETE FROM ss_chat_log");
             q.executeUpdate("DELETE FROM ss_invites");
             q.executeUpdate("DELETE FROM ss_members");
             q.executeUpdate("DELETE FROM ss_parties");
@@ -154,6 +157,34 @@ public final class SocialStoreIntegrationTest {
         assertEquals(2,store.getParty(a).size());
     }
 
+    @Test public void deliveredChatLogsAndRelaysOnlyToOtherProxy() throws Exception {
+        UUID sessionA = UUID.randomUUID(), sessionB = UUID.randomUUID();
+        store.sessionStarted(a,"Alice","proxy-1",sessionA,"lobby-1");
+        store.sessionStarted(b,"Bob","proxy-2",sessionB,"bedwars-1");
+        PartySnapshot party = store.create(a,3).value;
+        store.invite(a,b); store.accept(b,a);
+        Map<UUID,UUID> local = new HashMap<UUID,UUID>();
+        local.put(a,sessionA);
+        for (SocialStore.Notification notification : store.claimNotifications(local,50))
+            store.markDelivered(notification.id,sessionA);
+        Map<UUID,UUID> remote = new HashMap<UUID,UUID>();
+        remote.put(b,sessionB);
+        for (SocialStore.Notification notification : store.claimNotifications(remote,50))
+            store.markDelivered(notification.id,sessionB);
+        store.recordDeliveredChat(party.id,a,"instant","proxy-1");
+        assertTrue(store.claimNotifications(local,50).isEmpty());
+        assertTrue(store.claimNotifications(remote,50).stream().anyMatch(n ->
+            "CHAT".equals(n.kind) && "instant".equals(n.body)));
+        try (Connection c = source.getConnection();
+             java.sql.PreparedStatement q = c.prepareStatement(
+                 "SELECT body FROM ss_chat_log WHERE party_id=? AND sender_uuid=?")) {
+            q.setString(1,party.id.toString()); q.setString(2,a.toString());
+            try (java.sql.ResultSet rows = q.executeQuery()) {
+                assertTrue(rows.next()); assertEquals("instant",rows.getString(1));
+            }
+        }
+    }
+
     @Test public void leaderDisconnectGraceAndElection() throws Exception {
         store.create(a,3); store.invite(a,b); store.accept(b,a);
         advance(30001);
@@ -205,10 +236,32 @@ public final class SocialStoreIntegrationTest {
         assertTrue(store.sessionMatches(a,current));
         assertFalse(store.sessionMatches(a,old));
         store.create(a,2); store.invite(a,b);
-        List<SocialStore.Notification> first = store.claimNotifications(b,UUID.randomUUID(),50);
-        List<SocialStore.Notification> duplicate = store.claimNotifications(b,UUID.randomUUID(),50);
+        UUID staleB = UUID.randomUUID(), currentB = UUID.randomUUID();
+        store.sessionStarted(b,"Bob","proxy-test",staleB,"lobby-2");
+        store.sessionStarted(b,"Bob","proxy-test",currentB,"lobby-2");
+        Map<UUID,UUID> recipients = new HashMap<UUID,UUID>();
+        recipients.put(b,staleB);
+        assertTrue(store.claimNotifications(recipients,50).isEmpty());
+        recipients.put(b,currentB);
+        List<SocialStore.Notification> first = store.claimNotifications(recipients,50);
+        List<SocialStore.Notification> duplicate = store.claimNotifications(recipients,50);
         assertEquals(1,first.size());
         assertTrue(duplicate.isEmpty());
+    }
+
+    @Test public void batchClaimDeliversToDifferentRecipients() throws Exception {
+        UUID sessionA = UUID.randomUUID(), sessionB = UUID.randomUUID();
+        store.sessionStarted(a,"Alice","proxy-test",sessionA,"lobby-1");
+        store.sessionStarted(b,"Bob","proxy-test",sessionB,"lobby-2");
+        store.create(a,3); store.invite(a,b); store.accept(b,a);
+        Map<UUID,UUID> recipients = new HashMap<UUID,UUID>();
+        recipients.put(a,sessionA); recipients.put(b,sessionB);
+        List<SocialStore.Notification> notifications = store.claimNotifications(recipients,50);
+        assertTrue(notifications.stream().anyMatch(n -> n.recipient.equals(a)));
+        assertTrue(notifications.stream().anyMatch(n -> n.recipient.equals(b)));
+        for (SocialStore.Notification notification : notifications)
+            assertTrue(store.markDelivered(notification.id,recipients.get(notification.recipient)));
+        assertTrue(store.claimNotifications(recipients,50).isEmpty());
     }
 
     @Test public void unavailableDatabaseFailsClosedAndChatSanitizes() throws Exception {
