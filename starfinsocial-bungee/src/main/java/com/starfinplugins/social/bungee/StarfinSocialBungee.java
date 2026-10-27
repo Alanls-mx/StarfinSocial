@@ -2,10 +2,14 @@ package com.starfinplugins.social.bungee;
 
 import com.starfinplugins.social.api.*;
 import com.starfinplugins.social.common.SocialStore;
+import com.starfinplugins.social.common.FriendStore;
 import com.starfinplugins.social.common.PartyChatState;
 import com.starfinplugins.social.common.PartyRules;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
+import com.google.common.io.ByteArrayDataInput;
+import com.google.common.io.ByteArrayDataOutput;
+import com.google.common.io.ByteStreams;
 import java.lang.reflect.Field;
 import java.sql.SQLException;
 import java.util.Map;
@@ -28,6 +32,8 @@ import net.md_5.bungee.api.event.PlayerDisconnectEvent;
 import net.md_5.bungee.api.event.PostLoginEvent;
 import net.md_5.bungee.api.event.ServerConnectedEvent;
 import net.md_5.bungee.api.event.ChatEvent;
+import net.md_5.bungee.api.event.PluginMessageEvent;
+import net.md_5.bungee.api.connection.Server;
 import net.md_5.bungee.api.plugin.Command;
 import net.md_5.bungee.api.plugin.Listener;
 import net.md_5.bungee.api.plugin.Plugin;
@@ -36,20 +42,29 @@ import net.md_5.bungee.event.EventHandler;
 
 /** Network authority. All SQL work runs on the bounded worker pool. */
 public final class StarfinSocialBungee extends Plugin implements Listener {
+    private static final String FRIEND_CHANNEL="SSFriends";
     private SocialConfig config;
     private SocialMessages messages;
     private ThreadPoolExecutor io;
     private HikariDataSource pool;
     private volatile SocialStore store;
+    private volatile FriendStore friendStore;
     private LoginGate loginGate;
     private boolean loginPresent;
     private ScheduledTask maintenance;
     private final Map<UUID, UUID> sessions = new ConcurrentHashMap<UUID, UUID>();
+    private final Set<UUID> pendingFriendOnline = java.util.Collections.newSetFromMap(
+        new ConcurrentHashMap<UUID, Boolean>());
+    private final Set<UUID> announcedFriendOnline = java.util.Collections.newSetFromMap(
+        new ConcurrentHashMap<UUID, Boolean>());
     private final Set<UUID> chatMode = java.util.Collections.newSetFromMap(
         new ConcurrentHashMap<UUID, Boolean>());
     private final CopyOnWriteArrayList<PartyEventListener> listeners =
         new CopyOnWriteArrayList<PartyEventListener>();
+    private final CopyOnWriteArrayList<FriendEventListener> friendListeners =
+        new CopyOnWriteArrayList<FriendEventListener>();
     private final PartyService service = new Service();
+    private final FriendService friends = new Friends();
     private final PartyChatState chatState = new PartyChatState();
     private final AtomicBoolean maintaining = new AtomicBoolean();
     private volatile boolean stopping;
@@ -72,9 +87,13 @@ public final class StarfinSocialBungee extends Plugin implements Listener {
                     t.setDaemon(true); return t;
                 }, new ThreadPoolExecutor.AbortPolicy());
             getProxy().getPluginManager().registerListener(this, this);
+            getProxy().registerChannel(FRIEND_CHANNEL);
             registerSafe("party", new PartyCommand(this, "party"));
             if (config.aliasP) registerSafe("p", new PartyCommand(this, "p"));
             if (config.aliasPc) registerSafe("pc", new PartyChatCommand(this));
+            registerSafe("friend", new FriendCommand(this,"friend"));
+            registerSafe("friends", new FriendCommand(this,"friends"));
+            registerSafe("f", new FriendCommand(this,"f"));
             runIo(() -> initialize());
             maintenance = getProxy().getScheduler().schedule(this, () -> {
                 if (!maintaining.compareAndSet(false,true)) return;
@@ -117,8 +136,13 @@ public final class StarfinSocialBungee extends Plugin implements Listener {
             }
             SocialStore next = new SocialStore(pool, config.rules);
             next.migrate();
+            FriendStore nextFriends = new FriendStore(pool, config.friendExpirationMs,
+                config.friendCooldownMs, config.maxPendingFriends, config.allowOfflineRequests,
+                config.rules.presenceTimeoutMs, config.friendDefaults);
+            nextFriends.migrate();
+            friendStore = nextFriends;
             store = next;
-            getLogger().info("StarfinSocial MySQL pronto (ss_schema_migrations v2).");
+            getLogger().info("StarfinSocial MySQL pronto (ss_schema_migrations v3).");
             for (ProxiedPlayer player : getProxy().getPlayers()) startSession(player);
         } catch (Exception error) {
             warnDatabase("StarfinSocial MySQL indisponível; nova tentativa em breve ("
@@ -149,6 +173,13 @@ public final class StarfinSocialBungee extends Plugin implements Listener {
                     else chatState.apply(current);
                 }
                 if (authenticated(player)) recipients.put(player.getUniqueId(), session);
+                if (authenticated(player) && pendingFriendOnline.remove(player.getUniqueId())
+                        && friendStore != null) {
+                    if (friendStore.notifyPresence(player.getUniqueId(),true))
+                        publishFriend(new FriendEvent(FriendEvent.Type.FRIEND_ONLINE,
+                            player.getUniqueId(),null,System.currentTimeMillis()));
+                    announcedFriendOnline.add(player.getUniqueId());
+                }
             }
             if (heartbeatDue) lastHeartbeatAt = now;
             for (SocialStore.Notification notification : db.claimNotifications(recipients, 100)) {
@@ -169,7 +200,16 @@ public final class StarfinSocialBungee extends Plugin implements Listener {
                 }
                 if (db.markDelivered(notification.id, session)) deliver(player, notification);
             }
-            if (now - lastSweepAt >= 10000) { db.sweep(); lastSweepAt = now; }
+            if (now - lastSweepAt >= 10000) {
+                db.sweep();
+                if (friendStore != null) {
+                    friendStore.expireRequests();
+                    for (UUID expired:friendStore.expirePresence())
+                        publishFriend(new FriendEvent(FriendEvent.Type.FRIEND_OFFLINE,
+                            expired,null,System.currentTimeMillis()));
+                }
+                lastSweepAt = now;
+            }
             if (now - lastCleanupAt >= 60000) { db.cleanupNotifications(); lastCleanupAt = now; }
         } catch (SQLException | RuntimeException error) {
             warnDatabase("Falha transitória de Party/MySQL; operações serão rejeitadas até recuperar.");
@@ -199,6 +239,22 @@ public final class StarfinSocialBungee extends Plugin implements Listener {
             player.sendMessage(accept);
             player.sendMessage(deny);
         } else if ("CHAT".equals(n.kind)) player.sendMessage(messages.line("chat-line", vars));
+        else if (n.kind.startsWith("FRIEND_")) {
+            if ("FRIEND_REQUEST".equals(n.kind)
+                    && (actor==null || friendStore==null
+                        || !friendStore.requestDeliverable(actor,player.getUniqueId()))) return;
+            if (("FRIEND_ONLINE".equals(n.kind) || "FRIEND_OFFLINE".equals(n.kind))
+                    && (actor==null || friendStore==null
+                        || !friendStore.presenceDeliverable(actor,player.getUniqueId(),
+                            "FRIEND_ONLINE".equals(n.kind)))) return;
+            String key = n.kind.toLowerCase(java.util.Locale.ROOT).replace('_','-');
+            player.sendMessage(messages.line(key, vars("friend", name, "player", name)));
+            if ("FRIEND_REQUEST".equals(n.kind)) {
+                TextComponent accept = messages.line("friend-click-accept",vars("friend",name));
+                accept.setClickEvent(new ClickEvent(ClickEvent.Action.RUN_COMMAND,"/friend accept " + name));
+                player.sendMessage(accept);
+            }
+        }
         else {
             String key;
             switch (n.kind) {
@@ -233,12 +289,23 @@ public final class StarfinSocialBungee extends Plugin implements Listener {
     @EventHandler public void onQuit(PlayerDisconnectEvent event) {
         ProxiedPlayer player = event.getPlayer();
         UUID session = sessions.remove(player.getUniqueId());
+        pendingFriendOnline.remove(player.getUniqueId());
+        boolean announced=announcedFriendOnline.remove(player.getUniqueId());
         chatMode.remove(player.getUniqueId());
         chatState.clearCooldown(player.getUniqueId());
         if (session != null) runIo(() -> {
             try { if (store != null) store.sessionEnded(player.getUniqueId(), session); }
             catch (SQLException ignored) { /* presence timeout handles crash */ }
         });
+        if (session != null && announced) getProxy().getScheduler().schedule(this, () -> runIo(() -> {
+            try {
+                FriendStore db=friendStore;
+                if (db!=null && !db.isOnline(player.getUniqueId()))
+                    if (db.notifyPresence(player.getUniqueId(), false))
+                        publishFriend(new FriendEvent(FriendEvent.Type.FRIEND_OFFLINE,
+                            player.getUniqueId(),null,System.currentTimeMillis()));
+            } catch (SQLException error) { warnDatabase("Falha ao publicar saída de amigo."); }
+        }), 3, TimeUnit.SECONDS);
     }
 
     @EventHandler public void onChat(ChatEvent event) {
@@ -256,20 +323,75 @@ public final class StarfinSocialBungee extends Plugin implements Listener {
                     .replace('_','-'),null))));
         });
     }
+    void openFriendMenu(ProxiedPlayer player) {
+        if (player.getServer()==null) return;
+        ByteArrayDataOutput data=ByteStreams.newDataOutput();
+        data.writeUTF("open"); data.writeUTF(player.getUniqueId().toString());
+        player.getServer().sendData(FRIEND_CHANNEL,data.toByteArray());
+    }
+    @EventHandler public void onFriendMenuMessage(PluginMessageEvent event) {
+        if (!FRIEND_CHANNEL.equals(event.getTag()) || !(event.getSender() instanceof Server)
+                || !(event.getReceiver() instanceof ProxiedPlayer)) return;
+        event.setCancelled(true);
+        ProxiedPlayer player=(ProxiedPlayer)event.getReceiver();
+        Server sender=(Server)event.getSender();
+        if (player.getServer()==null || !sender.getInfo().equals(player.getServer().getInfo())
+                || !authenticated(player) || !friendPermitted(player,"use")) return;
+        try {
+            ByteArrayDataInput input=ByteStreams.newDataInput(event.getData());
+            if (!"click".equals(input.readUTF())
+                    || !player.getUniqueId().equals(UUID.fromString(input.readUTF()))) return;
+            String action=input.readUTF();
+            UUID target="toggle".equals(action) ? null : UUID.fromString(input.readUTF());
+            CompletableFuture<?> result;
+            switch (action) {
+                case "accept": result=friends.accept(player.getUniqueId(),target,
+                    FriendCommand.limit(player,this)); break;
+                case "deny": result=friends.deny(player.getUniqueId(),target); break;
+                case "cancel": result=friends.cancel(player.getUniqueId(),target); break;
+                case "remove": result=friends.remove(player.getUniqueId(),target); break;
+                case "party": result=service.invitePlayer(player.getUniqueId(),target); break;
+                case "toggle": result=friends.settings(player.getUniqueId()).thenCompose(s ->
+                    friends.setSetting(player.getUniqueId(),"requests",!s.allowRequests)); break;
+                default: return;
+            }
+            result.whenComplete((value,error) -> {
+                if (getProxy().getPlayer(player.getUniqueId())!=player) return;
+                if (error!=null) player.sendMessage(messages.line("friend-unavailable",null));
+                else if (value instanceof FriendResult && !((FriendResult)value).succeeded())
+                    player.sendMessage(messages.line("friend-error",vars("reason",
+                        messages.raw("friend-reason-"+((FriendResult)value).code.name()
+                            .toLowerCase(java.util.Locale.ROOT).replace('_','-'),null))));
+                else if (value instanceof PartyResult && !((PartyResult<?>)value).succeeded())
+                    player.sendMessage(messages.line("friend-error",vars("reason",
+                        messages.raw("reason-"+((PartyResult<?>)value).code.name()
+                            .toLowerCase(java.util.Locale.ROOT).replace('_','-'),null))));
+                else player.sendMessage(messages.line("friend-menu-updated",null));
+                openFriendMenu(player);
+            });
+        } catch (IllegalArgumentException | IndexOutOfBoundsException error) {
+            getLogger().warning("Mensagem inválida do menu de amigos.");
+        }
+    }
 
     private void startSession(ProxiedPlayer player) {
         SocialStore db = store;
         if (db == null || player == null || getProxy().getPlayer(player.getUniqueId()) != player)
             return;
+        if (!authenticated(player)) return;
         if (sessions.containsKey(player.getUniqueId())) return;
         UUID session = UUID.randomUUID();
         try {
+            boolean previouslyOnline = friendStore != null && friendStore.isOnline(player.getUniqueId());
             db.sessionStarted(player.getUniqueId(), player.getName(), config.proxyId,
                 session, server(player));
             sessions.put(player.getUniqueId(), session);
+            announcedFriendOnline.add(player.getUniqueId());
             PartySnapshot current = db.getParty(player.getUniqueId());
             if (current == null) chatState.forget(player.getUniqueId());
             else chatState.apply(current);
+            if (!previouslyOnline && friendStore != null)
+                pendingFriendOnline.add(player.getUniqueId());
         } catch (SQLException error) {
             getLogger().warning("Sessão social indisponível; tentativa automática.");
         }
@@ -284,16 +406,21 @@ public final class StarfinSocialBungee extends Plugin implements Listener {
         if (maintenance != null) maintenance.cancel();
         getProxy().getPluginManager().unregisterCommands(this);
         getProxy().getPluginManager().unregisterListeners(this);
+        getProxy().unregisterChannel(FRIEND_CHANNEL);
         if (io != null) {
             io.shutdown();
             try { if (!io.awaitTermination(5, TimeUnit.SECONDS)) io.shutdownNow(); }
             catch (InterruptedException error) { Thread.currentThread().interrupt(); io.shutdownNow(); }
         }
         if (pool != null) pool.close();
-        sessions.clear(); chatMode.clear(); listeners.clear(); store = null;
+        sessions.clear(); pendingFriendOnline.clear(); announcedFriendOnline.clear();
+        chatMode.clear(); listeners.clear(); friendListeners.clear();
+        store = null; friendStore = null;
     }
 
     public PartyService partyService() { return service; }
+    public FriendService friendService() { return friends; }
+    FriendStore friendDatabase() { return friendStore; }
     SocialStore database() { return store; }
     SocialConfig settings() { return config; }
     SocialMessages messages() { return messages; }
@@ -304,6 +431,106 @@ public final class StarfinSocialBungee extends Plugin implements Listener {
     }
     boolean permitted(ProxiedPlayer player, String action) {
         return PartyPermissions.allowed(config.defaultActions, player::hasPermission, action);
+    }
+    boolean friendPermitted(ProxiedPlayer player, String action) {
+        return player != null && (player.hasPermission("starfinsocial.friend.admin")
+            || player.hasPermission("starfinsocial.friend." + action)
+            || config.defaultFriendActions.contains(action));
+    }
+
+    private interface FriendChange { FriendResult run(FriendStore db) throws SQLException; }
+    private CompletableFuture<FriendResult> friendChange(UUID actor, UUID target,
+                                                         FriendEvent.Type type, String permission,
+                                                         FriendChange operation) {
+        return async(() -> {
+            ProxiedPlayer player=getProxy().getPlayer(actor);
+            UUID session=sessions.get(actor);
+            FriendStore db=friendStore;
+            if (db==null || player==null || session==null || !authenticated(player)
+                || !store.sessionMatches(actor,session) || !config.friendsEnabled)
+                return FriendResult.of(FriendResult.Code.UNAVAILABLE);
+            if (!friendPermitted(player,"use") || !friendPermitted(player,permission))
+                return FriendResult.of(FriendResult.Code.NO_PERMISSION);
+            FriendResult result=operation.run(db);
+            if (result.succeeded() && type!=null)
+                publishFriend(new FriendEvent(type,actor,target,System.currentTimeMillis()));
+            return result;
+        });
+    }
+    private void publishFriend(FriendEvent event) {
+        for (FriendEventListener listener:friendListeners) try { listener.onFriendEvent(event); }
+        catch (RuntimeException error) { getLogger().warning("Listener de amigos falhou."); }
+    }
+    private final class Friends implements FriendService {
+        @Override public CompletableFuture<FriendResult> add(UUID a,UUID t,int limit) {
+            return friendChange(a,t,FriendEvent.Type.REQUEST_SENT,"add",db -> config.friendRequestsEnabled
+                ? db.add(a,t,limit) : FriendResult.of(FriendResult.Code.UNAVAILABLE));
+        }
+        @Override public CompletableFuture<FriendResult> accept(UUID a,UUID t,int limit) {
+            return friendChange(a,t,FriendEvent.Type.REQUEST_ACCEPTED,"accept",db -> db.accept(a,t,limit));
+        }
+        @Override public CompletableFuture<FriendResult> deny(UUID a,UUID t) {
+            return friendChange(a,t,FriendEvent.Type.REQUEST_DENIED,"deny",db -> db.resolve(a,t,false));
+        }
+        @Override public CompletableFuture<FriendResult> cancel(UUID a,UUID t) {
+            return friendChange(a,t,FriendEvent.Type.REQUEST_CANCELLED,"add",db -> db.resolve(a,t,true));
+        }
+        @Override public CompletableFuture<FriendResult> remove(UUID a,UUID t) {
+            return friendChange(a,t,FriendEvent.Type.FRIEND_REMOVED,"remove",db -> db.remove(a,t));
+        }
+        @Override public CompletableFuture<Boolean> isFriend(UUID a,UUID t) {
+            return async(() -> { checkFriendReader(a);
+                return friendStore.isFriend(a,t); });
+        }
+        @Override public CompletableFuture<java.util.List<FriendEntry>> getFriends(UUID a,int page,int size) {
+            return async(() -> { checkFriendReader(a);
+                return friendStore.friends(a,page,size); });
+        }
+        @Override public CompletableFuture<java.util.List<FriendEntry>> getOnlineFriends(UUID a) {
+            return async(() -> { checkFriendReader(a);
+                java.util.List<FriendEntry> result=new java.util.ArrayList<FriendEntry>();
+                for (int page=1;page<=20;page++) {
+                    java.util.List<FriendEntry> entries=friendStore.friends(a,page,45);
+                    for (FriendEntry e:entries) if (e.online) result.add(e);
+                    if (entries.size()<45) break;
+                }
+                return java.util.Collections.unmodifiableList(result); });
+        }
+        @Override public CompletableFuture<Integer> countFriends(UUID a) {
+            return async(() -> { checkFriendReader(a); return friendStore.count(a); });
+        }
+        @Override public CompletableFuture<java.util.List<FriendRequest>> requests(UUID a,boolean received) {
+            return async(() -> { checkFriendReader(a);
+                return friendStore.requests(a,received); });
+        }
+        @Override public CompletableFuture<FriendSettings> settings(UUID a) {
+            return async(() -> { checkFriendReader(a);
+                return friendStore.settings(a); });
+        }
+        @Override public CompletableFuture<FriendResult> setSetting(UUID a,String key,boolean value) {
+            return friendChange(a,null,null,"settings",db -> db.setSetting(a,key,value));
+        }
+        @Override public CompletableFuture<Boolean> canSendFriendRequest(UUID a,UUID t) {
+            return async(() -> { checkFriendReader(a);
+                return friendStore.canSend(a,t,FriendCommand.limit(getProxy().getPlayer(a),
+                    StarfinSocialBungee.this)); });
+        }
+        @Override public CompletableFuture<Boolean> canInviteToParty(UUID a,UUID t) {
+            return async(() -> { checkFriendReader(a);
+                return friendStore.canInviteParty(a,t); });
+        }
+        @Override public AutoCloseable subscribe(FriendEventListener listener) {
+            if (listener==null) throw new IllegalArgumentException("listener");
+            friendListeners.add(listener); return () -> friendListeners.remove(listener);
+        }
+    }
+    private void checkFriendReader(UUID actor) throws SQLException {
+        ProxiedPlayer player=actor==null ? null : getProxy().getPlayer(actor);
+        UUID session=actor==null ? null : sessions.get(actor);
+        if (friendStore==null || store==null || player==null || session==null
+                || !authenticated(player) || !friendPermitted(player,"use")
+                || !store.sessionMatches(actor,session))
+            throw new SQLException("Friend reader unavailable");
     }
 
     boolean runIo(Runnable task) {
@@ -388,7 +615,8 @@ public final class StarfinSocialBungee extends Plugin implements Listener {
                 return CompletableFuture.completedFuture(PartyResult.fail(PartyResult.Code.NO_PERMISSION));
             return change(a, db -> db.create(a,n), PartyEvent.Type.CREATE); }
         @Override public CompletableFuture<PartyResult<InviteSnapshot>> invitePlayer(UUID a,UUID t) {
-            return change(a, t, db -> db.invite(a,t), PartyEvent.Type.INVITE); }
+            return change(a, t, db -> friendStore != null && !friendStore.canInviteParty(a,t)
+                ? PartyResult.fail(PartyResult.Code.PRIVACY) : db.invite(a,t), PartyEvent.Type.INVITE); }
         @Override public CompletableFuture<PartyResult<PartySnapshot>> acceptInvite(UUID a,UUID i) {
             return change(a, i, db -> db.accept(a,i), PartyEvent.Type.JOIN); }
         @Override public CompletableFuture<PartyResult<InviteSnapshot>> denyInvite(UUID a,UUID i) {

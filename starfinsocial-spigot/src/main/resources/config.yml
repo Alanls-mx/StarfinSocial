@@ -5,3 +5,24 @@ mysql:
   username: starfin
   password: CHANGE_ME
   ssl-mode: PREFERRED
+menu:
+  title: '&bAmigos'
+  error: '&c[Amigos] Dados temporariamente indisponíveis.'
+  friend-status: '&7Estado: &f{status}'
+  friend-actions: '&eEsquerdo: status &7| &cDireito: remover'
+  party-action: '&bShift + esquerdo: convidar para Party'
+  request-title: '&eSolicitação recebida'
+  request-actions: '&aEsquerdo: aceitar &7| &cDireito: recusar'
+  previous: '&ePágina anterior'
+  next: '&ePróxima página'
+  pending: '&bSolicitações enviadas: &f{count}'
+  toggle: '&bReceber solicitações: &f{value}'
+  settings: '&bPreferências: /friend settings'
+  refresh: '&aAtualizar'
+  friend-info: '&b[Amigos] /friend status {friend}; direito remove; Shift + esquerdo convida para Party.'
+  sent-title: '&eSolicitação enviada'
+  sent-actions: '&cClique para cancelar'
+  last-seen: '&7Última conexão: &f{time}'
+  hidden: 'Oculto'
+  online: 'Online'
+  offline: 'Offline'

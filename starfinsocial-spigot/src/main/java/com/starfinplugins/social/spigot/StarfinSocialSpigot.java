@@ -2,6 +2,8 @@ package com.starfinplugins.social.spigot;
 
 import com.starfinplugins.social.api.PartyDirectory;
 import com.starfinplugins.social.api.PartySnapshot;
+import com.starfinplugins.social.api.FriendSettings;
+import com.starfinplugins.social.common.FriendStore;
 import com.starfinplugins.social.common.PartyRules;
 import com.starfinplugins.social.common.SocialStore;
 import com.zaxxer.hikari.HikariConfig;
@@ -21,6 +23,7 @@ public final class StarfinSocialSpigot extends JavaPlugin {
     private HikariDataSource pool;
     private SocialStore store;
     private ThreadPoolExecutor io;
+    private FriendMenu friendMenu;
     private final PartyDirectory directory = new PartyDirectory() {
         @Override public CompletableFuture<PartySnapshot> getParty(UUID player) {
             return read(() -> store.getParty(player));
@@ -64,6 +67,9 @@ public final class StarfinSocialSpigot extends JavaPlugin {
             }, new ThreadPoolExecutor.AbortPolicy());
         getServer().getServicesManager().register(PartyDirectory.class, directory,
             this, ServicePriority.Normal);
+        FriendStore friends = new FriendStore(pool,7*86400000L,5000,25,true,30000,
+            new FriendSettings(true,true,false,true,true,true));
+        friendMenu = new FriendMenu(this,friends,io);
         getLogger().info("PartyDirectory registrada. SQL é consultado assincronamente.");
     }
 

@@ -1,15 +1,15 @@
-# StarfinSocial — Fase 4.1
+# StarfinSocial — Fase 4.2
 
-Plugin independente de Party para rede BungeeCord com servidores Spigot 1.8.8. Compila com Java 8. Não altera o StarfinBedWars nem o matchmaking do StarfinMinigames.
+Plugin independente de Party e amizades para rede BungeeCord com servidores Spigot 1.8.8. Compila com Java 8. Não altera o StarfinBedWars nem o matchmaking do StarfinMinigames.
 
 ## Módulos
 
 | Módulo | Responsabilidade |
 | --- | --- |
-| `starfinsocial-api` | Contratos assíncronos, snapshots imutáveis e eventos sem dependências de Bukkit/Bungee. |
-| `starfinsocial-common` | Regras, migração MySQL e operações transacionais. |
-| `starfinsocial-bungee` | Comandos, sessões da rede, alterações de Party, chat e entrega de notificações. |
-| `starfinsocial-spigot` | Serviço `PartyDirectory` somente leitura para plugins Bukkit. |
+| `starfinsocial-api` | Contratos assíncronos e modelos imutáveis sem dependências de Bukkit/Bungee. |
+| `starfinsocial-common` | Regras, migração MySQL e operações transacionais de Party e amigos. |
+| `starfinsocial-bungee` | Comandos, sessões da rede, Party, amigos, chat e notificações. |
+| `starfinsocial-spigot` | `PartyDirectory` somente leitura e menu visual de amigos. |
 
 O MySQL é a autoridade compartilhada. Cada alteração relevante da Party bloqueia sua linha (`SELECT ... FOR UPDATE`) e confirma membro, liderança, convite e notificação na mesma transação. `ss_members.player_uuid` impede filiação simultânea a duas Parties. O proxy usa UUIDs obtidos de `ProxiedPlayer`, nunca nomes como chave persistente. Nomes informados em comandos são resolvidos no banco e recusados se forem ambíguos.
 
@@ -21,7 +21,23 @@ As instâncias de BungeeCord gravam presença com um ID novo para cada sessão e
 2. Copie `starfinsocial-bungee/target/StarfinSocial-Bungee.jar` para `plugins/` de **cada** proxy.
 3. Copie `starfinsocial-spigot/target/StarfinSocial-Spigot.jar` para `plugins/` dos servidores Spigot que precisam da API local de leitura. O módulo Spigot é opcional para o funcionamento dos comandos no proxy.
 4. Edite `plugins/StarfinSocial/config.yml` em cada instância com o mesmo banco MySQL, usuário e senha. Use um `proxy-id` distinto em cada proxy. Credenciais não estão no código.
-5. Reinicie proxy e Spigot. O proxy aplica as migrações `ss_` v1 e v2. O Spigot não executa migrações nem altera Parties.
+5. Reinicie proxy e Spigot. O proxy aplica as migrações `ss_` v1 a v3. O Spigot não executa migrações nem altera Parties ou amizades.
+
+## Amizades — Fase 4.2
+
+O proxy executa `/friend help`, `/friend add <jogador>`, `/friend accept <jogador>`, `/friend deny <jogador>`, `/friend cancel <jogador>`, `/friend remove <jogador>`, `/friend list [página]`, `/friend requests`, `/friend pending`, `/friend settings`, `/friend settings <opção> on|off`, `/friend toggle` e `/friend status <jogador>`. `/friends` sem argumentos abre o menu de 54 slots no servidor Spigot; `/f` é alias de `/friend` se estiver livre. Os comandos do proxy funcionam em qualquer backend, mesmo quando o módulo Spigot não estiver instalado. Nesse caso, use `/friend list` como alternativa ao menu.
+
+O menu mostra até 36 amigos por página e nove solicitações recebidas. Clique esquerdo em uma solicitação aceita, direito recusa. Clique direito em um amigo remove a amizade; Shift + esquerdo envia convite pela API de Party existente. A ponte `SSFriends` parte do proxy para abrir o menu; ações enviadas pelo servidor são verificadas novamente com o UUID e a sessão autenticada no proxy. Dados são carregados fora da thread principal.
+
+As amizades usam o par ordenado de UUID em `ss_friendships`, que impede duplicação invertida. `ss_friend_requests` conserva o histórico e impõe no máximo uma solicitação pendente por par. `ss_friend_settings` armazena privacidade individual; `ss_friend_presence_announcements` limita avisos repetidos. Todas as escritas de amizade passam por uma transação serializada pela linha `ss_friend_mutex`; essa simplicidade garante limites e aceite simultâneo corretos, mas pode ser um ponto de contenção em redes muito grandes. `ss_presence` e `ss_notifications` continuam compartilhadas com a Party. O nome recente só serve para pesquisa e exibição.
+
+Configurações novas em `config.yml`: `friends.enabled`, `friends.default-max-friends`, `friends.per-page`, `friends.permissions.default-actions`, `friend-requests.*` e `friend-settings.default.*`. Arquivos já instalados sem essas chaves recebem os padrões no carregamento. Permissões: `starfinsocial.friend.use`, `.add`, `.accept`, `.deny`, `.remove`, `.list`, `.requests`, `.settings`, `.admin` e `.limit.100|250|500`. A lista `friends.permissions.default-actions` libera as ações normais por padrão; remova uma ação para exigir seu nó. `.admin` libera os comandos, mas não ignora as regras de privacidade e os limites de banco.
+
+Preferências: `requests`, `online-notify`, `offline-notify`, `show-online`, `show-server`, `party-invites`. Desligar `show-online` oculta status, servidor e última conexão no comando, menu e `FriendService`. Desligar `show-server` preserva apenas o status online. O convite de Party verifica `party-invites` para amigos sem substituir a lógica existente de Party.
+
+`FriendService` é obtido por `((StarfinSocialBungee) plugin).friendService()`; suas operações retornam `CompletableFuture`. Consultas de lista e presença exigem a sessão local autenticada do jogador que consulta. O proxy anuncia entrada e saída reais; trocar de backend só atualiza `ss_presence.server_name`. Uma saída espera três segundos para ignorar uma reconexão curta. A varredura detecta sessões cujo heartbeat expirou após queda do proxy. Notificações são entregues pelo mecanismo existente de `ss_notifications`.
+
+Teste MySQL: use um esquema **descartável** com `SOCIAL_TEST_JDBC`, `SOCIAL_TEST_USER` e `SOCIAL_TEST_PASSWORD` e execute `mvn -B clean verify`. `FriendStoreIntegrationTest` cobre solicitações, aceite, recusa, cancelamento, expiração, UUID/nome, privacidade, limites, concorrência e persistência. O servidor real deve ser validado com dois clientes em backends diferentes, inclusive o menu e a visibilidade de presença.
 
 O proxy e cada servidor Spigot têm configurações próprias. `mysql.ssl-mode` admite `DISABLED`, `PREFERRED`, `REQUIRED`, `VERIFY_CA` ou `VERIFY_IDENTITY`. Para um ambiente externo, configure TLS conforme o banco. A JAR contém o driver MySQL e Hikari isolados por relocation; não requer StarfinCore no proxy nem no Spigot.
 
@@ -73,8 +89,13 @@ O líder que se desconecta mantém sua posição por 120 segundos por padrão. S
 | `ss_cooldowns` | Limites de frequência. |
 | `ss_notifications` | Caixa de saída para convites, mudanças e chat destinado a outro proxy. |
 | `ss_chat_log` | Registro das mensagens após a entrega local (migração v2). |
+| `ss_friendships` | Pares canônicos de UUIDs de amizades bilaterais. |
+| `ss_friend_requests` | Histórico e solicitação pendente única por par. |
+| `ss_friend_settings` | Preferências de privacidade individuais. |
+| `ss_friend_presence_announcements` | Controle de avisos repetidos de presença. |
+| `ss_friend_mutex` | Serialização transacional de escritas de amizade. |
 
-Não há tabelas de amizades ou clãs nesta fase. As migrações são idempotentes e preservam os dados existentes.
+Não há tabelas de clãs nesta fase. As migrações são idempotentes e preservam os dados existentes.
 
 ## API pública
 
@@ -102,4 +123,4 @@ Nesta entrega foram executados testes automatizados contra MySQL 8 descartável 
 - A caixa de saída prioriza não duplicar notificações; uma queda exatamente após marcar uma mensagem como entregue pode perdê-la. Um transporte/ack de cliente pode ser acrescentado depois.
 - Uma Party de líder único é encerrada quando ele usa `/party leave`. Uma Party com outros membros exige transferir liderança ou usar `/party disband`.
 
-Amizades, clãs, preferências sociais por jogador e matchmaking em grupo ficam para os próximos prompts.
+Clãs ficam para o próximo prompt. O matchmaking em grupo já é responsabilidade do StarfinMinigames.

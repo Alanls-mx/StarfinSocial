@@ -38,3 +38,35 @@ party:
       - disband
       - chat
       - settings
+friends:
+  enabled: true
+  default-max-friends: 50
+  per-page: 10
+  permissions:
+    default-actions:
+      - use
+      - add
+      - accept
+      - deny
+      - remove
+      - list
+      - requests
+      - settings
+  permission-limits:
+    starfinsocial.friend.limit.100: 100
+    starfinsocial.friend.limit.250: 250
+    starfinsocial.friend.limit.500: 500
+friend-requests:
+  enabled: true
+  expiration-days: 7
+  cooldown-seconds: 5
+  max-pending-sent: 25
+  allow-offline-requests: true
+friend-settings:
+  default:
+    allow-requests: true
+    notify-friend-online: true
+    notify-friend-offline: false
+    show-online-status: true
+    show-current-server: true
+    allow-party-invites-from-friends: true
